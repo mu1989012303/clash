@@ -14,7 +14,30 @@ import (
 	"github.com/Dreamacro/clash/log"
 
 	D "github.com/miekg/dns"
+	"github.com/samber/lo"
 )
+
+const serverFailureCacheTTL uint32 = 5
+
+func minimalTTL(records []D.RR) uint32 {
+	rr := lo.MinBy(records, func(r1 D.RR, r2 D.RR) bool {
+		return r1.Header().Ttl < r2.Header().Ttl
+	})
+	if rr == nil {
+		return 0
+	}
+	return rr.Header().Ttl
+}
+
+func updateTTL(records []D.RR, ttl uint32) {
+	if len(records) == 0 {
+		return
+	}
+	delta := minimalTTL(records) - ttl
+	for i := range records {
+		records[i].Header().Ttl = lo.Clamp(records[i].Header().Ttl-delta, 1, records[i].Header().Ttl)
+	}
+}
 
 func putMsgToCache(c *cache.LruCache, key string, q D.Question, msg *D.Msg) {
 	// skip dns cache for acme challenge
@@ -24,19 +47,17 @@ func putMsgToCache(c *cache.LruCache, key string, q D.Question, msg *D.Msg) {
 	}
 
 	var ttl uint32
-	switch {
-	case len(msg.Answer) != 0:
-		ttl = msg.Answer[0].Header().Ttl
-	case len(msg.Ns) != 0:
-		ttl = msg.Ns[0].Header().Ttl
-	case len(msg.Extra) != 0:
-		ttl = msg.Extra[0].Header().Ttl
-	default:
-		log.Debugln("[DNS] response msg empty: %#v", msg)
+	if msg.Rcode == D.RcodeServerFailure {
+		// [...] a resolver MAY cache a server failure response.
+		// If it does so it MUST NOT cache it for longer than five (5) minutes [...]
+		ttl = serverFailureCacheTTL
+	} else {
+		ttl = minimalTTL(append(append(msg.Answer, msg.Ns...), msg.Extra...))
+	}
+	if ttl == 0 {
 		return
 	}
-
-	c.SetWithExpire(key, msg.Copy(), time.Now().Add(time.Second*time.Duration(ttl)))
+	c.SetWithExpire(key, msg.Copy(), time.Now().Add(time.Duration(ttl)*time.Second))
 }
 
 func setMsgTTL(msg *D.Msg, ttl uint32) {
@@ -51,6 +72,12 @@ func setMsgTTL(msg *D.Msg, ttl uint32) {
 	for _, extra := range msg.Extra {
 		extra.Header().Ttl = ttl
 	}
+}
+
+func updateMsgTTL(msg *D.Msg, ttl uint32) {
+	updateTTL(msg.Answer, ttl)
+	updateTTL(msg.Ns, ttl)
+	updateTTL(msg.Extra, ttl)
 }
 
 func isIPRequest(q D.Question) bool {

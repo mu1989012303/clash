@@ -16,6 +16,7 @@ import (
 	C "github.com/Dreamacro/clash/constant"
 
 	D "github.com/miekg/dns"
+	"github.com/samber/lo"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -141,9 +142,14 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 		msg = cache.(*D.Msg).Copy()
 		if expireTime.Before(now) {
 			setMsgTTL(msg, uint32(1)) // Continue fetch
-			go r.exchangeWithoutCache(ctx, m)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
+				r.exchangeWithoutCache(ctx, m)
+				cancel()
+			}()
 		} else {
-			setMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
+			// updating TTL by subtracting common delta time from each DNS record
+			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
 		}
 		return
 	}
@@ -161,7 +167,10 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 			}
 
 			msg := result.(*D.Msg)
-
+			// OPT RRs MUST NOT be cached, forwarded, or stored in or loaded from master files.
+			msg.Extra = lo.Filter(msg.Extra, func(rr D.RR, index int) bool {
+				return rr.Header().Rrtype != D.TypeOPT
+			})
 			putMsgToCache(r.lruCache, q.String(), q, msg)
 		}()
 
@@ -256,7 +265,10 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 	res := <-msgCh
 	if res.Error == nil {
 		if ips := msgToIP(res.Msg); len(ips) != 0 {
-			if !r.shouldIPFallback(ips[0]) {
+			shouldNotFallback := lo.EveryBy(ips, func(ip net.IP) bool {
+				return !r.shouldIPFallback(ip)
+			})
+			if shouldNotFallback {
 				msg = res.Msg // no need to wait for fallback result
 				err = res.Error
 				return msg, err
